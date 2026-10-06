@@ -1,0 +1,77 @@
+name: Collecte Maps agences
+
+on:
+  workflow_dispatch:
+    inputs:
+      limite:
+        description: "Agences max par job (0 = toutes ; mettre 5 pour un test)"
+        default: "0"
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Collecte (une clé de départ par job, rotation ensuite)
+        env:
+          # Un seul secret, une clé par ligne
+          SEARLO_KEYS: ${{ secrets.SEARLO_KEYS }}
+        run: >
+          python collect_maps.py
+          --shard ${{ matrix.shard }}
+          --num-shards 13
+          --maps-dir maps
+          --out-dir maps_new
+          --limit ${{ github.event.inputs.limite || 0 }}
+
+      - name: Sauvegarde des nouveaux fichiers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maps-shard-${{ matrix.shard }}
+          path: maps_new/
+          if-no-files-found: ignore
+          retention-days: 3
+
+  commit:
+    needs: collect
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: maps-shard-*
+          path: maps
+          merge-multiple: true
+
+      - name: Commit des résultats dans maps/
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add maps
+          if git diff --cached --quiet; then
+            echo "Rien de nouveau."
+            exit 0
+          fi
+          git commit -m "maps: nouveaux résultats ($(git diff --cached --name-only | wc -l) fichiers)"
+          for i in 1 2 3; do
+            git pull --rebase && git push && break
+            sleep 5
+          done
