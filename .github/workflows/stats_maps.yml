@@ -16,5 +16,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Compteurs (agences, doublons, sites web)
+      - name: Compteurs (agences, doublons, sites web, réseaux, catégories)
         run: python stats_maps.py maps
+
+      - name: Liste complète des catégories (maps_categories.csv)
+        uses: actions/upload-artifact@v4
+        with:
+          name: maps-categories
+          path: maps_categories.csv
+          retention-days: 14
+          
