@@ -8,8 +8,9 @@ Répond à 5 questions :
   4. combien d'agences uniques (sans doublons)
   5. combien d'agences uniques ont un site web
 
-Une fiche est une "agence immobilière" si `category` (catégorie principale) ou
-une des `categories` (liste complète) contient un mot de AGENCE_KEYWORDS.
+Une fiche est une "agence immobilière" si son champ `category` est exactement
+« Agence immobilière » (voir AGENCE_CATEGORIES). Toutes les autres catégories sont
+listées et comptées dans le rapport et dans maps_categories.csv.
 Une agence est "du CSV" si, dans le même code postal, son adresse OU son nom
 correspond à celui d'une agence du CSV (voir match_*).
 
@@ -25,14 +26,10 @@ import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
 
-# --- À adapter si besoin : mots (sans accents, minuscules) qui désignent une agence
-AGENCE_KEYWORDS = (
-    "agence immobili",
-    "agent immobilier",
-    "agence de location immobili",
-    "agence de location d'appartements",
-    "agence de location de maisons",
-)
+# --- Catégorie principale (`category`) EXACTE qui définit une agence.
+# Écrite sans accents ni majuscules. On peut en ajouter d'autres ici après avoir
+# regardé la liste des catégories dans le rapport.
+AGENCE_CATEGORIES = {"agence immobiliere"}
 
 GENERIC_NAME = {
     "immobilier", "immobiliere", "immobiliers", "immobilieres", "immo", "agence", "agences",
@@ -67,8 +64,8 @@ def place_key(p):
 
 
 def is_agence(p):
-    cats = [p.get("category")] + list(p.get("categories") or [])
-    return any(k in norm(c) for c in cats if c for k in AGENCE_KEYWORDS)
+    """Agence = `category` exactement « Agence immobilière » (champ principal seul)."""
+    return norm(p.get("category")).strip() in AGENCE_CATEGORIES
 
 
 def place_cp(addr):
@@ -173,6 +170,7 @@ def main():
     ap.add_argument("dir", nargs="?", default="maps")
     ap.add_argument("--csv", default="agences_tier_A_actives.csv")
     ap.add_argument("--reseaux", default="reseaux.txt")
+    ap.add_argument("--categories-out", default="maps_categories.csv")
     args = ap.parse_args()
 
     files = sorted(p for p in Path(args.dir).glob("*.jsonl") if not p.name.startswith("_"))
@@ -327,11 +325,34 @@ def main():
             out.append(f"- Réseaux sans aucune fiche Maps ({len(absents)}) : "
                        + ", ".join(absents[:40]) + (" …" if len(absents) > 40 else ""))
 
-    cats = Counter(v["category"] for v in places.values()).most_common(8)
+    # --- autres catégories (lieux uniques, champ `category`)
+    cats = Counter(v["category"] for v in places.values())
+    sans_cat = cats.pop("?", 0)
+    exact = [c for c in cats if norm(c).strip() in AGENCE_CATEGORIES]
+    autres = [(c, n) for c, n in cats.most_common() if c not in exact]
+    proches = [(c, n) for c, n in autres
+               if any(m in norm(c) for m in ("immobili", "syndic", "agent", "location", "notaire"))]
     out.append("")
-    out.append("### Catégories principales (lieux uniques)")
-    for c, n in cats:
-        out.append(f"- {c} : {n}")
+    out.append("### Catégories (champ `category`, lieux uniques)")
+    out.append(f"- Agence immobilière (exact) : **{sum(cats[c] for c in exact)}**")
+    out.append(f"- Sans catégorie : {sans_cat}")
+    out.append(f"- Autres catégories : **{len(autres)}** différentes, "
+               f"{sum(n for _, n in autres)} lieux")
+    out.append("- Proches de l'immobilier (à décider) :")
+    for c, n in proches[:30]:
+        out.append(f"  - {c} : {n}")
+    out.append("- Les 25 plus fréquentes :")
+    for c, n in autres[:25]:
+        out.append(f"  - {c} : {n}")
+    with open(args.categories_out, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["categorie", "lieux_uniques", "type"])
+        for c in exact:
+            w.writerow([c, cats[c], "agence (filtre)"])
+        for c, n in autres:
+            w.writerow([c, n, "proche immobilier" if (c, n) in proches else "autre"])
+        if sans_cat:
+            w.writerow(["(sans catégorie)", sans_cat, "autre"])
 
     report = "\n".join(out)
     print(report)
@@ -343,4 +364,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-  
+              
