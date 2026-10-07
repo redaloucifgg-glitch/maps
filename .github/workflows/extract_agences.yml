@@ -1,0 +1,30 @@
+name: Export agences uniques avec site web
+
+on:
+  workflow_dispatch:
+    inputs:
+      tous:
+        description: "Inclure aussi les agences sans site web ? (oui/non)"
+        default: "non"
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Export (agences uniques, dédoublonnées par placeId)
+        run: python extract_agences.py maps ${{ github.event.inputs.tous == 'oui' && '--tous' || '' }}
+
+      - name: Fichiers à télécharger
+        uses: actions/upload-artifact@v4
+        with:
+          name: agences-uniques
+          path: |
+            agences_uniques_site_web.csv
+            agences_uniques_site_web.jsonl
+          retention-days: 30
