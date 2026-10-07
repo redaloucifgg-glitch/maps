@@ -1,0 +1,42 @@
+name: Export indépendants
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Export des agences indépendantes
+        run: python export_independants.py --dir maps --out exports
+
+      - name: Télécharger les fichiers depuis le run
+        uses: actions/upload-artifact@v4
+        with:
+          name: independants
+          path: exports/
+          retention-days: 14
+
+      - name: Commit dans exports/
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add exports
+          if git diff --cached --quiet; then
+            echo "Rien de nouveau."
+            exit 0
+          fi
+          git commit -m "exports: agences indépendantes"
+          for i in 1 2 3; do
+            git pull --rebase && git push && break
+            sleep 5
+          done
