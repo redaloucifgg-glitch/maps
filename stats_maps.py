@@ -125,6 +125,45 @@ def name_score(variants, title, city):
     return best
 
 
+TLD = re.compile(r"\.(com|fr)$")
+
+
+def load_reseaux(path):
+    """Lit reseaux.txt. Renvoie ({forme compacte: nom}, {motif brut: nom}).
+    Forme compacte = mots collés, sans accents : « Meg Agence » = « megAgence »."""
+    compact_map, raw_map = {}, {}
+    p = Path(path)
+    if not p.exists():
+        return compact_map, raw_map
+    for line in p.read_text(encoding="utf-8").splitlines():
+        name = line.strip()
+        if not name or name.startswith("#"):
+            continue
+        base = TLD.sub("", norm(name))
+        compact = "".join(words(base))
+        if len(compact) >= 3:
+            compact_map.setdefault(compact, name)
+        elif base.strip():
+            raw_map.setdefault(base.strip(), name)   # ex. « 3%.com » -> « 3% »
+    return compact_map, raw_map
+
+
+def networks_in(text, compact_map, raw_map, max_words=5):
+    """Réseaux dont le nom apparaît dans `text` (mots entiers, 1 à 5 mots collés)."""
+    ws = words(text)
+    found = set()
+    for i in range(len(ws)):
+        acc = ""
+        for j in range(i, min(i + max_words, len(ws))):
+            acc += ws[j]
+            if acc in compact_map:
+                found.add(compact_map[acc])
+    if raw_map:
+        t = norm(text)
+        found.update(name for raw, name in raw_map.items() if raw in t)
+    return found
+
+
 def pct(a, b):
     return f"{100 * a / b:.0f} %" if b else "-"
 
@@ -133,6 +172,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dir", nargs="?", default="maps")
     ap.add_argument("--csv", default="agences_tier_A_actives.csv")
+    ap.add_argument("--reseaux", default="reseaux.txt")
     args = ap.parse_args()
 
     files = sorted(p for p in Path(args.dir).glob("*.jsonl") if not p.name.startswith("_"))
@@ -204,6 +244,7 @@ def main():
     out.append(f"- **{ag_web}** / {len(agences)} ({pct(ag_web, len(agences))})")
 
     # --- 3. correspondance avec le CSV
+    rows = []
     if Path(args.csv).exists():
         with open(args.csv, encoding="utf-8-sig", newline="") as f:
             rows = list(csv.DictReader(f))
@@ -255,6 +296,37 @@ def main():
         out.append(f"- Fiches qui ne sont pas dans le CSV (nouvelles agences) : "
                    f"**{len(agences) - matched_places}**")
 
+    # --- 6. réseaux (via les noms)
+    cmap, rmap = load_reseaux(args.reseaux)
+    if cmap or rmap:
+        all_names = list(cmap.values()) + list(rmap.values())
+        maps_c, csv_c = Counter(), Counter()
+        n_maps = n_csv = 0
+        for v in agences.values():
+            hit = networks_in(v["title"], cmap, rmap)
+            n_maps += bool(hit)
+            maps_c.update(hit)
+        for r in rows:
+            hit = networks_in(f'{r["nom"]} {r.get("enseigne") or ""}', cmap, rmap)
+            n_csv += bool(hit)
+            csv_c.update(hit)
+        out.append("")
+        out.append("### 6. Réseaux (liste reseaux.txt, via les noms)")
+        out.append(f"- Réseaux dans la liste : **{len(all_names)}**")
+        out.append(f"- Agences Maps uniques dans un réseau : **{n_maps}** / {len(agences)} "
+                   f"({pct(n_maps, len(agences))}) · indépendantes : {len(agences) - n_maps}")
+        out.append(f"  - réseaux retrouvés sur Maps : **{len(maps_c)}** / {len(all_names)}")
+        if rows:
+            out.append(f"- Agences du CSV dans un réseau (nom ou enseigne) : **{n_csv}** / {len(rows)} "
+                       f"({pct(n_csv, len(rows))}) · réseaux retrouvés : {len(csv_c)}")
+        out.append("- Top 15 réseaux (fiches Maps · agences CSV) :")
+        for name, c in maps_c.most_common(15):
+            out.append(f"  - {name} : {c} · {csv_c.get(name, 0)}")
+        absents = [n for n in all_names if n not in maps_c]
+        if absents:
+            out.append(f"- Réseaux sans aucune fiche Maps ({len(absents)}) : "
+                       + ", ".join(absents[:40]) + (" …" if len(absents) > 40 else ""))
+
     cats = Counter(v["category"] for v in places.values()).most_common(8)
     out.append("")
     out.append("### Catégories principales (lieux uniques)")
@@ -271,4 +343,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-                    
+  
