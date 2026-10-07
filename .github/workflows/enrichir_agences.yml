@@ -1,0 +1,57 @@
+name: Enrichissement agences (adresse, CP, ville, horaires)
+
+on:
+  workflow_dispatch:
+    inputs:
+      csv:
+        description: "CSV d'entrée"
+        default: "agences.csv"
+      overwrite:
+        description: "Écraser adresse/CP/ville existants ? (true/false)"
+        default: "false"
+
+permissions:
+  contents: write
+
+jobs:
+  enrichir:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Enrichissement par correspondance de noms
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.overwrite }}" = "true" ]; then ARGS="--overwrite"; fi
+          python enrichir_agences.py \
+            --csv "${{ github.event.inputs.csv || 'agences.csv' }}" \
+            --maps-dir maps \
+            --out agences_enrichies.csv \
+            $ARGS
+
+      - name: Sauvegarde du résultat
+        uses: actions/upload-artifact@v4
+        with:
+          name: agences-enrichies
+          path: agences_enrichies.csv
+          retention-days: 7
+
+      - name: Commit du résultat
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add agences_enrichies.csv
+          if git diff --cached --quiet; then
+            echo "Rien de nouveau."
+            exit 0
+          fi
+          git commit -m "agences: enrichissement adresse/CP/ville/horaires"
+          for i in 1 2 3; do
+            git pull --rebase && git push && break
+            sleep 5
+          done
