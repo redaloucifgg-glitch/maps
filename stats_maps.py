@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
-"""Compteurs sur les résultats collectés dans maps/*.jsonl :
-agences, résultats Maps, doublons, sites web.
+"""Compteurs sur les résultats collectés dans maps/*.jsonl.
+
+Répond à 5 questions :
+  1. combien de résultats Maps sont des agences immobilières
+  2. combien de doublons
+  3. combien de fiches correspondent vraiment à une agence du CSV
+  4. combien d'agences uniques (sans doublons)
+  5. combien d'agences uniques ont un site web
+
+Une fiche est une "agence immobilière" si `category` (catégorie principale) ou
+une des `categories` (liste complète) contient un mot de AGENCE_KEYWORDS.
+Une agence est "du CSV" si, dans le même code postal, son adresse OU son nom
+correspond à celui d'une agence du CSV (voir match_*).
 
 Usage : python stats_maps.py [dossier=maps] [--csv agences_tier_A_actives.csv]
 Si $GITHUB_STEP_SUMMARY existe, le rapport y est aussi écrit.
@@ -9,9 +20,45 @@ import argparse
 import csv
 import json
 import os
-from collections import Counter
+import re
+import unicodedata
+from collections import Counter, defaultdict
 from pathlib import Path
-from urllib.parse import urlparse
+
+# --- À adapter si besoin : mots (sans accents, minuscules) qui désignent une agence
+AGENCE_KEYWORDS = (
+    "agence immobili",
+    "agent immobilier",
+    "agence de location immobili",
+    "agence de location d'appartements",
+    "agence de location de maisons",
+)
+
+GENERIC_NAME = {
+    "immobilier", "immobiliere", "immobiliers", "immobilieres", "immo", "agence", "agences",
+    "sarl", "sas", "sasu", "eurl", "sci", "sa", "societe", "cabinet", "groupe", "gestion",
+    "transaction", "transactions", "conseil", "et", "de", "la", "le", "les", "des", "du",
+    "en", "au", "aux", "sur", "sous", "the",
+}
+STREET_TYPES = {
+    "rue", "avenue", "ave", "av", "boulevard", "bd", "bld", "blvd", "place", "pl", "allee",
+    "all", "chemin", "che", "impasse", "imp", "route", "rte", "cours", "quai", "square", "sq",
+    "passage", "pass", "esplanade", "residence", "res", "zone", "zi", "za", "lotissement",
+    "lot", "batiment", "bat", "galerie", "centre", "ccial", "commercial", "des", "les", "du",
+    "de", "la", "le", "sur", "sous", "bis", "ter",
+}
+WORD = re.compile(r"[a-z0-9]+")
+CP = re.compile(r"\b(\d{5})\b")
+
+
+def norm(s):
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return s.lower().replace("’", "'")
+
+
+def words(s):
+    return WORD.findall(norm(s).replace("&", " "))
 
 
 def place_key(p):
@@ -19,11 +66,67 @@ def place_key(p):
             or f"{p.get('title')}|{p.get('address')}")
 
 
-def domain_of(p):
-    d = (p.get("domain") or "").strip().lower()
-    if not d and p.get("website"):
-        d = urlparse(p["website"]).netloc.lower()
-    return d.removeprefix("www.")
+def is_agence(p):
+    cats = [p.get("category")] + list(p.get("categories") or [])
+    return any(k in norm(c) for c in cats if c for k in AGENCE_KEYWORDS)
+
+
+def place_cp(addr):
+    found = CP.findall(addr or "")
+    return found[-1] if found else None
+
+
+def street_part(addr, title=None):
+    """Partie 'numéro + rue' d'une adresse (sans titre Maps, sans code postal ni ville)."""
+    a = addr or ""
+    if title and a.startswith(title):
+        a = a[len(title):].lstrip(", ")
+    m = list(CP.finditer(a))
+    if m:
+        a = a[: m[-1].start()]
+    return a
+
+
+def addr_sig(addr, title=None):
+    s = street_part(addr, title)
+    nums = set(re.findall(r"\d+", s))
+    street = {w for w in words(s) if w.isalpha() and len(w) >= 3 and w not in STREET_TYPES}
+    return nums, street
+
+
+def name_tokens(*texts):
+    return {w for t in texts for w in words(t) if len(w) >= 2 and not w.isdigit()
+            and w not in GENERIC_NAME}
+
+
+def match_address(csv_sig, place_sig):
+    (n1, s1), (n2, s2) = csv_sig, place_sig
+    return bool(n1 & n2) and bool(s1 & s2)
+
+
+def name_variants(nom, enseigne):
+    """Nom du CSV découpé : nom principal, chaque alias entre parenthèses, enseigne."""
+    segs = [s for s in re.split(r"[()]", nom or "") if s.strip()]
+    if (enseigne or "").strip():
+        segs.append(enseigne)
+    return [t for t in (name_tokens(s) for s in segs) if t]
+
+
+def name_score(variants, title, city):
+    """Meilleure ressemblance (0 à 1) entre le titre Maps et un nom du CSV.
+    Les mots de la ville sont ignorés (« Dijon » ne prouve rien)."""
+    t = name_tokens(title) - city
+    best = 0.0
+    for v in variants:
+        v = v - city
+        common = v & t
+        if v and common and any(len(w) >= 3 for w in common):
+            best = max(best, len(common) / len(v | t))
+    return best
+
+
+def pct(a, b):
+    return f"{100 * a / b:.0f} %" if b else "-"
 
 
 def main():
@@ -33,15 +136,13 @@ def main():
     args = ap.parse_args()
 
     files = sorted(p for p in Path(args.dir).glob("*.jsonl") if not p.name.startswith("_"))
-    agences_vides = 0
+
     lignes = 0
-    lignes_web = 0
-    key_files = {}          # clé de lieu -> nb d'agences (fichiers) où il apparaît
-    key_has_web = {}        # clé de lieu -> a un site web
-    key_domain = {}
-    top1_total = 0
-    top1_web = 0
-    dup_intra = 0           # même lieu 2 fois dans un même fichier
+    lignes_agence = 0
+    vides = 0
+    illisibles = 0
+    places = {}              # clé de lieu -> infos utiles
+    nb_fichiers = Counter()  # clé de lieu -> nb d'agences (fichiers) où il apparaît
 
     for fp in files:
         seen = set()
@@ -51,64 +152,114 @@ def main():
                 line = line.strip()
                 if not line:
                     continue
-                p = json.loads(line)
+                try:
+                    p = json.loads(line)
+                except json.JSONDecodeError:
+                    illisibles += 1
+                    continue
                 n += 1
                 lignes += 1
                 k = place_key(p)
+                ag = is_agence(p)
+                lignes_agence += ag
                 web = bool((p.get("website") or "").strip())
-                lignes_web += web
-                if k in seen:
-                    dup_intra += 1
-                else:
+                if k not in places:
+                    places[k] = {"title": p.get("title") or "", "address": p.get("address") or "",
+                                 "web": web, "agence": ag, "category": p.get("category") or "?"}
+                elif web:
+                    places[k]["web"] = True
+                if k not in seen:
                     seen.add(k)
-                    key_files[k] = key_files.get(k, 0) + 1
-                key_has_web[k] = key_has_web.get(k, False) or web
-                if web:
-                    key_domain[k] = domain_of(p)
-                if n == 1:
-                    top1_total += 1
-                    top1_web += web
+                    nb_fichiers[k] += 1
         if n == 0:
-            agences_vides += 1
+            vides += 1
 
-    uniques = len(key_files)
-    partages = [k for k, c in key_files.items() if c > 1]
-    lignes_en_trop = sum(c - 1 for c in key_files.values() if c > 1)
-    uniq_web = sum(1 for v in key_has_web.values() if v)
-    domaines = Counter(d for d in key_domain.values() if d)
-    domaines_multi = sum(1 for c in domaines.values() if c > 1)
+    agences = {k: v for k, v in places.items() if v["agence"]}
+    ag_web = sum(1 for v in agences.values() if v["web"])
+    ag_multi = sum(1 for k in agences if nb_fichiers[k] > 1)
 
     out = ["## Compteurs Maps", ""]
-    out.append(f"- Agences interrogées (fichiers) : **{len(files)}**")
-    out.append(f"  - avec au moins 1 résultat : {len(files) - agences_vides}")
-    out.append(f"  - sans résultat : {agences_vides}")
+    out.append("### Vue d'ensemble")
+    out.append(f"- Agences du CSV interrogées : **{len(files)}** ({vides} sans aucun résultat)")
     out.append(f"- Résultats Maps (lignes) : **{lignes}**")
-    out.append(f"- Lieux uniques (par placeId) : **{uniques}**")
+    out.append(f"- Lieux uniques (tous types) : **{len(places)}**")
+    if illisibles:
+        out.append(f"- Lignes illisibles ignorées : {illisibles}")
     out.append("")
-    out.append("### Doublons")
-    out.append(f"- Lieux présents dans plusieurs agences : **{len(partages)}** "
-               f"({lignes_en_trop} lignes en trop)")
-    out.append(f"- Doublons à l'intérieur d'un même fichier : {dup_intra}")
+    out.append("### 1. Agences immobilières")
+    out.append(f"- Résultats qui sont des agences immobilières : **{lignes_agence}** / {lignes} "
+               f"({pct(lignes_agence, lignes)})")
+    out.append(f"- Autres lieux (pas des agences, ex. siège social) : "
+               f"{len(places) - len(agences)} lieux uniques")
     out.append("")
-    out.append("### Sites web")
-    out.append(f"- Résultats avec site web : **{lignes_web}** / {lignes}")
-    out.append(f"- Lieux uniques avec site web : **{uniq_web}** / {uniques}")
-    out.append(f"- Domaines uniques : **{len(domaines)}** "
-               f"(dont {domaines_multi} partagés par plusieurs lieux)")
-    out.append(f"- 1er résultat de chaque agence avec site web : "
-               f"**{top1_web}** / {top1_total}")
+    out.append("### 2. Doublons")
+    out.append(f"- Lignes en trop sur les agences : **{lignes_agence - len(agences)}** "
+               f"({lignes_agence} lignes pour {len(agences)} agences)")
+    out.append(f"- Agences qui apparaissent dans plusieurs recherches : **{ag_multi}**")
+    out.append("")
+    out.append("### 4. Agences uniques (sans doublons)")
+    out.append(f"- **{len(agences)}** agences immobilières uniques")
+    out.append("")
+    out.append("### 5. Agences uniques avec site web")
+    out.append(f"- **{ag_web}** / {len(agences)} ({pct(ag_web, len(agences))})")
 
+    # --- 3. correspondance avec le CSV
     if Path(args.csv).exists():
         with open(args.csv, encoding="utf-8-sig", newline="") as f:
             rows = list(csv.DictReader(f))
-        sirens = Counter(r["siren"].strip().zfill(9) for r in rows)
-        nom_adr = Counter((r["nom"].strip().upper(), r["adresse"].strip().upper()) for r in rows)
+        by_cp = defaultdict(list)
+        for r in rows:
+            cp = (r.get("code_postal") or "").strip().zfill(5) or place_cp(r["adresse"])
+            by_cp[cp].append((
+                r["siren"].strip().zfill(9),
+                addr_sig(r["adresse"]),
+                name_variants(r["nom"], r.get("enseigne") or ""),
+                set(words(r.get("ville") or "")),
+            ))
+
+        matched_places = 0
+        matched_web = 0
+        by_type = Counter()
+        sirens = set()
+        for v in agences.values():
+            cands = by_cp.get(place_cp(v["address"]), [])
+            if not cands:
+                continue
+            psig = addr_sig(v["address"], v["title"])
+            pcity = set(words(v["address"].rsplit(place_cp(v["address"]) or "\0", 1)[-1]))
+            best = None   # (rang, score, siren, adresse?, nom?) : 1 seule agence du CSV par fiche
+            for siren, csig, variants, ccity in cands:
+                a = match_address(csig, psig)
+                sc = name_score(variants, v["title"], pcity | ccity)
+                nm = sc >= 0.5
+                if a or nm:
+                    cand = (2 * a + nm, sc, siren, a, nm)
+                    if best is None or cand[:2] > best[:2]:
+                        best = cand
+            if best:
+                _, _, siren, hit_a, hit_n = best
+                sirens.add(siren)
+                matched_places += 1
+                matched_web += v["web"]
+                by_type["adresse + nom" if hit_a and hit_n else "adresse seule" if hit_a else "nom seul"] += 1
+
         out.append("")
-        out.append("### CSV source")
-        out.append(f"- Agences dans le CSV : **{len(rows)}** "
-                   f"({len(rows) - len(files)} restantes à collecter)")
-        out.append(f"- SIREN en double : {sum(1 for c in sirens.values() if c > 1)}")
-        out.append(f"- Même nom + même adresse : {sum(1 for c in nom_adr.values() if c > 1)}")
+        out.append("### 3. Fiches qui correspondent au CSV")
+        out.append(f"- Fiches (agences uniques) qui correspondent à une agence du CSV : "
+                   f"**{matched_places}** / {len(agences)} ({pct(matched_places, len(agences))})")
+        out.append(f"  - dont avec site web : {matched_web}")
+        out.append(f"  - par adresse + nom : {by_type['adresse + nom']} · "
+                   f"adresse seule : {by_type['adresse seule']} · nom seul : {by_type['nom seul']}")
+        out.append(f"- Agences du CSV retrouvées sur Maps : **{len(sirens)}** / {len(rows)} "
+                   f"({pct(len(sirens), len(rows))})")
+        out.append(f"- Fiches qui ne sont pas dans le CSV (nouvelles agences) : "
+                   f"**{len(agences) - matched_places}**")
+
+    cats = Counter(v["category"] for v in places.values()).most_common(8)
+    out.append("")
+    out.append("### Catégories principales (lieux uniques)")
+    for c, n in cats:
+        out.append(f"- {c} : {n}")
 
     report = "\n".join(out)
     print(report)
@@ -120,3 +271,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+                    
